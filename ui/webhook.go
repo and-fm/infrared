@@ -53,14 +53,15 @@ type receiverResource struct {
 // ---- model -----------------------------------------------------------------
 
 type webhookModel struct {
-	state      webhookFormState
-	appInput   textinput.Model
-	envOptions []webhookEnvOption
-	envCursor  int
-	focused    int // 0 = appInput, 1 = env list
-	results    []webhookEnvResult
-	errMsg     string
-	spinner    spinner.Model
+	state       webhookFormState
+	appInput    textinput.Model
+	secretInput textinput.Model
+	envOptions  []webhookEnvOption
+	envCursor   int
+	focused     int // 0 = appInput, 1 = secretInput, 2 = env list
+	results     []webhookEnvResult
+	errMsg      string
+	spinner     spinner.Model
 }
 
 // ---- messages --------------------------------------------------------------
@@ -76,6 +77,13 @@ func newWebhookModel() webhookModel {
 	input.Width = 36
 	input.Focus()
 
+	secret := textinput.New()
+	secret.Placeholder = "webhook secret"
+	secret.CharLimit = 255
+	secret.Width = 36
+	secret.EchoMode = textinput.EchoPassword
+	secret.EchoCharacter = '•'
+
 	opts := make([]webhookEnvOption, len(allEnvs))
 	for i, e := range allEnvs {
 		opts[i] = webhookEnvOption{name: e}
@@ -86,76 +94,100 @@ func newWebhookModel() webhookModel {
 	s.Style = dimStyle
 
 	return webhookModel{
-		state:      webhookStateForm,
-		appInput:   input,
-		envOptions: opts,
-		spinner:    s,
+		state:       webhookStateForm,
+		appInput:    input,
+		secretInput: secret,
+		envOptions:  opts,
+		spinner:     s,
 	}
 }
 
 // ---- commands --------------------------------------------------------------
 
-func runWebhookConfig(app string, envs []string) tea.Cmd {
+func runWebhookConfig(app, secret string, envs []string) tea.Cmd {
 	return func() tea.Msg {
-		results := make([]webhookEnvResult, 0, len(envs))
+		results := make([]webhookEnvResult, 0, len(envs)+1)
 		for _, env := range envs {
-			results = append(results, configureEnvWebhook(app, env))
+			results = append(results, configureEnvWebhook(app, env, secret))
 		}
+		results = append(results, configureImageWebhook(app, secret))
 		return webhookDoneMsg{results: results}
 	}
 }
 
-func configureEnvWebhook(app, env string) webhookEnvResult {
-	r := webhookEnvResult{env: env}
-
-	receiverName := app + "-repo-receiver-" + env
+func getReceiverURL(receiverName string) (string, error) {
 	out, err := exec.Command(
 		"kubectl", "get", "receivers", receiverName,
 		"-n", "flux-system",
 		"-o", "json",
 	).CombinedOutput()
 	if err != nil {
-		r.err = "kubectl: " + strings.TrimSpace(string(out))
-		return r
+		return "", fmt.Errorf("kubectl: %s", strings.TrimSpace(string(out)))
 	}
 
 	var resource receiverResource
 	if parseErr := json.Unmarshal(out, &resource); parseErr != nil {
-		r.err = "failed to parse receiver output"
-		return r
+		return "", fmt.Errorf("failed to parse receiver output")
 	}
 
 	if len(resource.Status.Conditions) == 0 {
-		r.err = "receiver has no status conditions"
-		return r
+		return "", fmt.Errorf("receiver has no status conditions")
 	}
 	if !strings.EqualFold(resource.Status.Conditions[0].Type, "ready") {
-		r.err = fmt.Sprintf("receiver not ready (condition: %q)", resource.Status.Conditions[0].Type)
-		return r
+		return "", fmt.Errorf("receiver not ready (condition: %q)", resource.Status.Conditions[0].Type)
 	}
-
 	if resource.Status.WebhookPath == "" {
-		r.err = "receiver has empty webhookPath"
-		return r
+		return "", fmt.Errorf("receiver has empty webhookPath")
 	}
-	r.url = fluxHookBase + resource.Status.WebhookPath
+	return fluxHookBase + resource.Status.WebhookPath, nil
+}
 
-	// Create the GitHub push webhook for this receiver URL.
-	ghOut, ghErr := exec.Command(
-		"gh", "api",
+func createGitHubWebhook(app, webhookURL, secret string) error {
+	ghArgs := []string{
+		"api",
 		fmt.Sprintf("repos/%s/%s/hooks", githubOrg, app),
 		"-X", "POST",
-		"-f", "config[url]="+r.url,
-		"-f", "config[content_type]=json",
+		"-f", "config[url]=" + webhookURL,
+		"-f", "config[content_type]=form",
 		"-f", "config[insecure_ssl]=0",
 		"-f", "events[]=push",
 		"-F", "active=true",
-	).CombinedOutput()
-	if ghErr != nil {
-		r.err = "gh api: " + strings.TrimSpace(string(ghOut))
+	}
+	if secret != "" {
+		ghArgs = append(ghArgs, "-f", "config[secret]="+secret)
+	}
+	out, err := exec.Command("gh", ghArgs...).CombinedOutput() //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("gh api: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func configureEnvWebhook(app, env, secret string) webhookEnvResult {
+	r := webhookEnvResult{env: env}
+	url, err := getReceiverURL(app + "-repo-receiver-" + env)
+	if err != nil {
+		r.err = err.Error()
 		return r
 	}
+	r.url = url
+	if err := createGitHubWebhook(app, url, secret); err != nil {
+		r.err = err.Error()
+	}
+	return r
+}
 
+func configureImageWebhook(app, secret string) webhookEnvResult {
+	r := webhookEnvResult{env: "image"}
+	url, err := getReceiverURL(app + "-image-receiver")
+	if err != nil {
+		r.err = err.Error()
+		return r
+	}
+	r.url = url
+	if err := createGitHubWebhook(app, url, secret); err != nil {
+		r.err = err.Error()
+	}
 	return r
 }
 
@@ -192,39 +224,53 @@ func (m webhookModel) Update(msg tea.Msg) (webhookModel, tea.Cmd) {
 				return newWebhookModel(), func() tea.Msg { return navigateBackMsg{} }
 
 			case "tab":
-				if m.focused == 0 {
+				switch m.focused {
+				case 0:
 					m.appInput.Blur()
+					m.secretInput.Focus()
 					m.focused = 1
-				} else {
+				case 1:
+					m.secretInput.Blur()
+					m.focused = 2
+				case 2:
 					m.focused = 0
 					m.appInput.Focus()
 				}
 
 			case "shift+tab":
-				if m.focused == 1 {
+				switch m.focused {
+				case 0:
+					m.appInput.Blur()
+					m.focused = 2
+				case 1:
+					m.secretInput.Blur()
 					m.focused = 0
 					m.appInput.Focus()
-				} else {
-					m.appInput.Blur()
+				case 2:
 					m.focused = 1
+					m.secretInput.Focus()
 				}
 
 			case "up", "k":
-				if m.focused == 1 && m.envCursor > 0 {
+				if m.focused == 2 && m.envCursor > 0 {
 					m.envCursor--
 				}
 
 			case "down", "j":
-				if m.focused == 1 && m.envCursor < len(m.envOptions)-1 {
+				if m.focused == 2 && m.envCursor < len(m.envOptions)-1 {
 					m.envCursor++
 				}
 
 			case " ":
-				if m.focused == 1 {
+				if m.focused == 2 {
 					m.envOptions[m.envCursor].selected = !m.envOptions[m.envCursor].selected
-				} else {
+				} else if m.focused == 0 {
 					var cmd tea.Cmd
 					m.appInput, cmd = m.appInput.Update(msg)
+					return m, cmd
+				} else {
+					var cmd tea.Cmd
+					m.secretInput, cmd = m.secretInput.Update(msg)
 					return m, cmd
 				}
 
@@ -248,13 +294,17 @@ func (m webhookModel) Update(msg tea.Msg) (webhookModel, tea.Cmd) {
 				m.errMsg = ""
 				return m, tea.Batch(
 					m.spinner.Tick,
-					runWebhookConfig(appName, selectedEnvs),
+					runWebhookConfig(appName, m.secretInput.Value(), selectedEnvs),
 				)
 
 			default:
 				if m.focused == 0 {
 					var cmd tea.Cmd
 					m.appInput, cmd = m.appInput.Update(msg)
+					return m, cmd
+				} else if m.focused == 1 {
+					var cmd tea.Cmd
+					m.secretInput, cmd = m.secretInput.Update(msg)
 					return m, cmd
 				}
 			}
@@ -312,6 +362,15 @@ func (m webhookModel) View() string {
 	}
 	sb.WriteString("\n\n")
 
+	sb.WriteString(inputLabelStyle.Render("Webhook secret"))
+	sb.WriteString("\n")
+	if m.focused == 1 {
+		sb.WriteString(activeInputStyle.Render(m.secretInput.View()))
+	} else {
+		sb.WriteString(inactiveInputStyle.Render(m.secretInput.View()))
+	}
+	sb.WriteString("\n\n")
+
 	sb.WriteString(inputLabelStyle.Render("Environments"))
 	sb.WriteString("\n")
 
@@ -324,13 +383,13 @@ func (m webhookModel) View() string {
 		if opt.selected {
 			check = "[✓]"
 		}
-		if m.focused == 1 && i == m.envCursor {
+		if m.focused == 2 && i == m.envCursor {
 			envLines.WriteString(selectedItemStyle.Render("▶ " + check + " " + opt.name))
 		} else {
 			envLines.WriteString(normalItemStyle.Render("  " + check + " " + opt.name))
 		}
 	}
-	if m.focused == 1 {
+	if m.focused == 2 {
 		sb.WriteString(activeInputStyle.Render(envLines.String()))
 	} else {
 		sb.WriteString(inactiveInputStyle.Render(envLines.String()))
