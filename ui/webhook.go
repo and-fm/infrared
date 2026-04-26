@@ -142,7 +142,7 @@ func getReceiverURL(receiverName string) (string, error) {
 	return fluxHookBase + resource.Status.WebhookPath, nil
 }
 
-func createGitHubWebhook(app, webhookURL, secret string) error {
+func createGitHubWebhook(app, webhookURL, secret string, events []string) error {
 	ghArgs := []string{
 		"api",
 		fmt.Sprintf("repos/%s/%s/hooks", githubOrg, app),
@@ -150,8 +150,10 @@ func createGitHubWebhook(app, webhookURL, secret string) error {
 		"-f", "config[url]=" + webhookURL,
 		"-f", "config[content_type]=form",
 		"-f", "config[insecure_ssl]=0",
-		"-f", "events[]=push",
 		"-F", "active=true",
+	}
+	for _, e := range events {
+		ghArgs = append(ghArgs, "-f", "events[]="+e)
 	}
 	if secret != "" {
 		ghArgs = append(ghArgs, "-f", "config[secret]="+secret)
@@ -171,7 +173,7 @@ func configureEnvWebhook(app, env, secret string) webhookEnvResult {
 		return r
 	}
 	r.url = url
-	if err := createGitHubWebhook(app, url, secret); err != nil {
+	if err := createGitHubWebhook(app, url, secret, []string{"push"}); err != nil {
 		r.err = err.Error()
 	}
 	return r
@@ -185,7 +187,7 @@ func configureImageWebhook(app, secret string) webhookEnvResult {
 		return r
 	}
 	r.url = url
-	if err := createGitHubWebhook(app, url, secret); err != nil {
+	if err := createGitHubWebhook(app, url, secret, []string{"package"}); err != nil {
 		r.err = err.Error()
 	}
 	return r
