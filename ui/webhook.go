@@ -253,14 +253,44 @@ func (m webhookModel) Update(msg tea.Msg) (webhookModel, tea.Cmd) {
 					m.secretInput.Focus()
 				}
 
-			case "up", "k":
+			case "up":
 				if m.focused == 2 && m.envCursor > 0 {
 					m.envCursor--
 				}
 
-			case "down", "j":
+			case "down":
 				if m.focused == 2 && m.envCursor < len(m.envOptions)-1 {
 					m.envCursor++
+				}
+
+			case "k":
+				if m.focused == 2 {
+					if m.envCursor > 0 {
+						m.envCursor--
+					}
+				} else {
+					var cmd tea.Cmd
+					if m.focused == 0 {
+						m.appInput, cmd = m.appInput.Update(msg)
+					} else {
+						m.secretInput, cmd = m.secretInput.Update(msg)
+					}
+					return m, cmd
+				}
+
+			case "j":
+				if m.focused == 2 {
+					if m.envCursor < len(m.envOptions)-1 {
+						m.envCursor++
+					}
+				} else {
+					var cmd tea.Cmd
+					if m.focused == 0 {
+						m.appInput, cmd = m.appInput.Update(msg)
+					} else {
+						m.secretInput, cmd = m.secretInput.Update(msg)
+					}
+					return m, cmd
 				}
 
 			case " ":
