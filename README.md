@@ -15,6 +15,6 @@ This is a tool that helps us manage our infra more easily, at the present time t
 - `gh` installed and authenticated with Github
 
 Install `ir`:  
-`go install github.com/and-fm/infrared@main`
+`go install github.com/and-fm/infrared/cmd/ir@main`
 
 Then to run, simply execute `ir` in the terminal
